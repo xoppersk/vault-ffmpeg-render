@@ -4,28 +4,15 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const http = require('http');
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
-const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-// R2 config from env
-const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
-const R2_ACCESS_KEY = process.env.R2_ACCESS_KEY;
-const R2_SECRET_KEY = process.env.R2_SECRET_KEY;
-const R2_BUCKET = process.env.R2_BUCKET || 'vault-clips';
+// Config from env
+const WORKER_URL = process.env.WORKER_URL || 'https://vault-clip-host.sevynholdings.workers.dev';
+const WORKER_TOKEN = process.env.WORKER_TOKEN || 'vault-w4-upload-2026';
 const RENDER_TOKEN = process.env.RENDER_TOKEN || 'vault-render-2026';
 const PORT = process.env.PORT || 3000;
-
-const s3 = new S3Client({
-  region: 'auto',
-  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  credentials: {
-    accessKeyId: R2_ACCESS_KEY,
-    secretAccessKey: R2_SECRET_KEY,
-  },
-});
 
 // Download file from URL to local path (follows redirects)
 function downloadFile(url, destPath) {
@@ -48,9 +35,52 @@ function downloadFile(url, destPath) {
   });
 }
 
+// Upload buffer to R2 via Worker endpoint (proven path)
+function uploadToR2(buffer, filename) {
+  return new Promise((resolve, reject) => {
+    const base64 = buffer.toString('base64');
+    const body = JSON.stringify({ data: base64, encoding: 'base64' });
+    const url = new URL(WORKER_URL + '/upload?filename=' + encodeURIComponent(filename));
+
+    const options = {
+      hostname: url.hostname,
+      port: 443,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + WORKER_TOKEN,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.success) {
+            resolve(parsed);
+          } else {
+            reject(new Error('Worker upload failed: ' + JSON.stringify(parsed)));
+          }
+        } catch (e) {
+          reject(new Error('Worker response parse error: ' + data.substring(0, 200)));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(120000, () => { req.destroy(new Error('Worker upload timeout')); });
+    req.write(body);
+    req.end();
+  });
+}
+
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'vault-ffmpeg-render', version: '1.0.0' });
+  res.json({ status: 'ok', service: 'vault-ffmpeg-render', version: '1.1.0' });
 });
 
 // Main render endpoint
@@ -127,7 +157,7 @@ app.post('/render', async (req, res) => {
     const encodeTime = ((Date.now() - startEncode) / 1000).toFixed(1);
     console.log(`[${jobId}] Encode complete in ${encodeTime}s`);
 
-    // === STEP 3: Upload to R2 ===
+    // === STEP 3: Upload to R2 via Worker ===
     const outputBuffer = fs.readFileSync(outputPath);
     const sizeMB = (outputBuffer.length / 1024 / 1024).toFixed(1);
     const sanitized = (title || 'vault-video')
@@ -135,29 +165,18 @@ app.post('/render', async (req, res) => {
       .substring(0, 50)
       .trim()
       .replace(/ /g, '-');
-    const r2Key = `renders/${sanitized}-${jobId}.mp4`;
+    const filename = `renders/${sanitized}-${jobId}.mp4`;
 
-    console.log(`[${jobId}] Uploading ${sizeMB}MB to R2 as ${r2Key}...`);
-    await s3.send(new PutObjectCommand({
-      Bucket: R2_BUCKET,
-      Key: r2Key,
-      Body: outputBuffer,
-      ContentType: 'video/mp4',
-    }));
-
-    const presignedUrl = await getSignedUrl(
-      s3,
-      new GetObjectCommand({ Bucket: R2_BUCKET, Key: r2Key }),
-      { expiresIn: 21600 }
-    );
+    console.log(`[${jobId}] Uploading ${sizeMB}MB to R2 via Worker as ${filename}...`);
+    const uploadResult = await uploadToR2(outputBuffer, filename);
 
     console.log(`[${jobId}] Done. Cleaning up tmp files.`);
     fs.rmSync(tmpDir, { recursive: true, force: true });
 
     res.json({
       success: true,
-      url: presignedUrl,
-      key: r2Key,
+      url: uploadResult.presigned_url,
+      key: filename,
       size: outputBuffer.length,
       size_mb: parseFloat(sizeMB),
       duration: totalDuration,
@@ -177,5 +196,5 @@ app.post('/render', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`vault-ffmpeg-render listening on port ${PORT}`);
+  console.log(`vault-ffmpeg-render v1.1.0 listening on port ${PORT}`);
 });
