@@ -1,5 +1,5 @@
 const express = require('express');
-const { execSync } = require('child_process');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
@@ -8,13 +8,11 @@ const http = require('http');
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-// Config from env
-const WORKER_URL = process.env.WORKER_URL || 'https://vault-clip-host.sevynholdings.workers.dev';
-const WORKER_TOKEN = process.env.WORKER_TOKEN || 'vault-w4-upload-2026';
-const RENDER_TOKEN = process.env.RENDER_TOKEN || 'vault-render-2026';
+const WORKER_URL = process.env.WORKER_URL;
+const WORKER_TOKEN = process.env.WORKER_TOKEN;
+const RENDER_TOKEN = process.env.RENDER_TOKEN;
 const PORT = process.env.PORT || 3000;
 
-// Download file from URL to local path (follows redirects)
 function downloadFile(url, destPath) {
   return new Promise((resolve, reject) => {
     const proto = url.startsWith('https') ? https : http;
@@ -24,7 +22,7 @@ function downloadFile(url, destPath) {
         return;
       }
       if (response.statusCode !== 200 && response.statusCode !== 206) {
-        reject(new Error(`Download failed: HTTP ${response.statusCode} for ${url.substring(0, 80)}...`));
+        reject(new Error(`Download failed: HTTP ${response.statusCode}`));
         return;
       }
       const file = fs.createWriteStream(destPath);
@@ -35,166 +33,162 @@ function downloadFile(url, destPath) {
   });
 }
 
-// Upload buffer to R2 via Worker endpoint (proven path)
 function uploadToR2(buffer, filename) {
   return new Promise((resolve, reject) => {
     const base64 = buffer.toString('base64');
     const body = JSON.stringify({ data: base64, encoding: 'base64' });
     const url = new URL(WORKER_URL + '/upload?filename=' + encodeURIComponent(filename));
-
     const options = {
-      hostname: url.hostname,
-      port: 443,
-      path: url.pathname + url.search,
-      method: 'POST',
+      hostname: url.hostname, port: 443,
+      path: url.pathname + url.search, method: 'POST',
       headers: {
         'Authorization': 'Bearer ' + WORKER_TOKEN,
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body)
       }
     };
-
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          if (parsed.success) {
-            resolve(parsed);
-          } else {
-            reject(new Error('Worker upload failed: ' + JSON.stringify(parsed)));
-          }
-        } catch (e) {
-          reject(new Error('Worker response parse error: ' + data.substring(0, 200)));
-        }
+          parsed.success ? resolve(parsed) : reject(new Error('Upload failed: ' + JSON.stringify(parsed)));
+        } catch (e) { reject(new Error('Parse error: ' + data.substring(0, 200))); }
       });
     });
-
     req.on('error', reject);
-    req.setTimeout(120000, () => { req.destroy(new Error('Worker upload timeout')); });
+    req.setTimeout(120000, () => { req.destroy(new Error('Upload timeout')); });
     req.write(body);
     req.end();
   });
 }
 
-// Health check
+function runFFmpeg(cmd, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('sh', ['-c', cmd], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    let killed = false;
+
+    const timer = setTimeout(() => {
+      killed = true;
+      proc.kill('SIGKILL');
+      reject(new Error('FFmpeg timed out after ' + (timeoutMs / 1000) + 's'));
+    }, timeoutMs);
+
+    proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (killed) return;
+      if (code === 0) {
+        resolve(stderr);
+      } else {
+        const tail = stderr.length > 500 ? stderr.slice(-500) : stderr;
+        reject(new Error('FFmpeg exited with code ' + code + ': ' + tail));
+      }
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'vault-ffmpeg-render', version: '1.1.0' });
+  res.json({ status: 'ok', service: 'vault-ffmpeg-render', version: '1.2.0' });
 });
 
-// Main render endpoint
 app.post('/render', async (req, res) => {
-  // Auth check
-  const auth = req.headers.authorization;
-  if (auth !== `Bearer ${RENDER_TOKEN}`) {
+  if (req.headers.authorization !== 'Bearer ' + RENDER_TOKEN) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-
   const { clips, audio, title, clip_duration } = req.body;
-  if (!clips || !Array.isArray(clips) || clips.length === 0) {
-    return res.status(400).json({ error: 'clips array required' });
-  }
-  if (!audio) {
-    return res.status(400).json({ error: 'audio URL required' });
-  }
+  if (!clips || !clips.length) return res.status(400).json({ error: 'clips array required' });
+  if (!audio) return res.status(400).json({ error: 'audio URL required' });
 
   const jobId = Date.now().toString();
-  const tmpDir = `/tmp/render-${jobId}`;
+  const tmpDir = '/tmp/render-' + jobId;
   fs.mkdirSync(tmpDir, { recursive: true });
-
   const secPerClip = clip_duration || 5;
   const totalDuration = clips.length * secPerClip;
 
+  console.log('[' + jobId + '] Downloading ' + clips.length + ' clips + 1 audio...');
+
   try {
-    // === STEP 1: Download all clips + audio in parallel ===
-    console.log(`[${jobId}] Downloading ${clips.length} clips + 1 audio...`);
-    const startDl = Date.now();
-
-    const clipPromises = clips.map((url, i) => {
-      const dest = path.join(tmpDir, `clip${String(i).padStart(2, '0')}.mp4`);
-      return downloadFile(url, dest).then(() => dest);
+    var downloadStart = Date.now();
+    var clipPromises = clips.map(function(url, i) {
+      var dest = path.join(tmpDir, 'clip' + String(i).padStart(2, '0') + '.mp4');
+      return downloadFile(url, dest).then(function() { return dest; });
     });
-    const audioDest = path.join(tmpDir, 'voiceover.mp3');
-    clipPromises.push(downloadFile(audio, audioDest).then(() => audioDest));
+    var audioDest = path.join(tmpDir, 'voiceover.mp3');
+    clipPromises.push(downloadFile(audio, audioDest).then(function() { return audioDest; }));
+    var allPaths = await Promise.all(clipPromises);
+    var clipPaths = allPaths.slice(0, -1);
+    var dlTime = ((Date.now() - downloadStart) / 1000).toFixed(1);
+    console.log('[' + jobId + '] Downloads complete in ' + dlTime + 's');
 
-    const allPaths = await Promise.all(clipPromises);
-    const clipPaths = allPaths.slice(0, -1);
-    console.log(`[${jobId}] Downloads complete in ${((Date.now() - startDl) / 1000).toFixed(1)}s`);
+    var inputs = clipPaths.map(function(p) { return '-i "' + p + '"'; }).join(' ');
+    var filterParts = clipPaths.map(function(_, i) {
+      return '[' + i + ':v]scale=1920:1080,setsar=1,fps=30[v' + i + ']';
+    });
+    var concatInputs = clipPaths.map(function(_, i) { return '[v' + i + ']'; }).join('');
+    var filterComplex = filterParts.join('; ') +
+      '; ' + concatInputs + 'concat=n=' + clipPaths.length + ':v=1:a=0[outv]';
+    var outputPath = path.join(tmpDir, 'output.mp4');
 
-    // === STEP 2: Build and run ffmpeg command ===
-    const inputs = clipPaths.map(p => `-i "${p}"`).join(' ');
-    const audioInput = `-i "${audioDest}"`;
+    var cmd = 'ffmpeg ' + inputs + ' -i "' + audioDest + '" ' +
+      '-filter_complex "' + filterComplex + '" ' +
+      '-map "[outv]" -map ' + clipPaths.length + ':a ' +
+      '-c:v libx264 -crf 23 -preset fast -pix_fmt yuv420p -r 30 ' +
+      '-c:a aac -b:a 192k -movflags +faststart ' +
+      '-t ' + totalDuration + ' -y "' + outputPath + '"';
 
-    const filterParts = clipPaths.map((_, i) =>
-      `[${i}:v]scale=1920:1080,setsar=1,fps=30[v${i}]`
-    );
-    const concatInputs = clipPaths.map((_, i) => `[v${i}]`).join('');
-    const filterComplex = filterParts.join('; ') +
-      `; ${concatInputs}concat=n=${clipPaths.length}:v=1:a=0[outv]`;
+    console.log('[' + jobId + '] Running ffmpeg (' + clipPaths.length + ' clips, ' + totalDuration + 's output)...');
+    var encodeStart = Date.now();
+    await runFFmpeg(cmd, 300000);
+    var encodeTime = ((Date.now() - encodeStart) / 1000).toFixed(1);
+    console.log('[' + jobId + '] Encode complete in ' + encodeTime + 's');
 
-    const audioIndex = clipPaths.length;
-    const outputPath = path.join(tmpDir, 'output.mp4');
+    if (!fs.existsSync(outputPath)) {
+      throw new Error('FFmpeg produced no output file');
+    }
+    var outputBuffer = fs.readFileSync(outputPath);
+    if (outputBuffer.length < 10000) {
+      throw new Error('Output too small: ' + outputBuffer.length + ' bytes');
+    }
+    var sizeMb = (outputBuffer.length / 1024 / 1024).toFixed(1);
+    console.log('[' + jobId + '] Output: ' + sizeMb + 'MB');
 
-    const cmd = [
-      'ffmpeg',
-      inputs,
-      audioInput,
-      `-filter_complex "${filterComplex}"`,
-      '-map "[outv]"',
-      `-map ${audioIndex}:a`,
-      '-c:v libx264 -crf 23 -preset fast -pix_fmt yuv420p -r 30',
-      '-c:a aac -b:a 192k',
-      '-movflags +faststart',
-      `-t ${totalDuration}`,
-      '-y',
-      `"${outputPath}"`,
-    ].join(' ');
+    var sanitized = (title || 'video').replace(/[^a-zA-Z0-9 ]/g, '')
+      .substring(0, 50).trim().replace(/ /g, '-');
+    var r2Filename = 'renders/' + sanitized + '-' + jobId + '.mp4';
 
-    console.log(`[${jobId}] Running ffmpeg (${clips.length} clips, ${totalDuration}s output)...`);
-    const startEncode = Date.now();
-    execSync(cmd, { timeout: 600000, stdio: 'pipe' });
-    const encodeTime = ((Date.now() - startEncode) / 1000).toFixed(1);
-    console.log(`[${jobId}] Encode complete in ${encodeTime}s`);
+    console.log('[' + jobId + '] Uploading to R2: ' + r2Filename + '...');
+    var uploadStart = Date.now();
+    var uploadResult = await uploadToR2(outputBuffer, r2Filename);
+    var uploadTime = ((Date.now() - uploadStart) / 1000).toFixed(1);
+    console.log('[' + jobId + '] Upload complete in ' + uploadTime + 's');
 
-    // === STEP 3: Upload to R2 via Worker ===
-    const outputBuffer = fs.readFileSync(outputPath);
-    const sizeMB = (outputBuffer.length / 1024 / 1024).toFixed(1);
-    const sanitized = (title || 'vault-video')
-      .replace(/[^a-zA-Z0-9 ]/g, '')
-      .substring(0, 50)
-      .trim()
-      .replace(/ /g, '-');
-    const filename = `renders/${sanitized}-${jobId}.mp4`;
-
-    console.log(`[${jobId}] Uploading ${sizeMB}MB to R2 via Worker as ${filename}...`);
-    const uploadResult = await uploadToR2(outputBuffer, filename);
-
-    console.log(`[${jobId}] Done. Cleaning up tmp files.`);
     fs.rmSync(tmpDir, { recursive: true, force: true });
 
     res.json({
       success: true,
       url: uploadResult.presigned_url,
-      key: filename,
-      size: outputBuffer.length,
-      size_mb: parseFloat(sizeMB),
+      size_mb: parseFloat(sizeMb),
       duration: totalDuration,
       encode_time_s: parseFloat(encodeTime),
+      upload_time_s: parseFloat(uploadTime),
       job_id: jobId,
     });
+    console.log('[' + jobId + '] Done');
 
   } catch (err) {
-    console.error(`[${jobId}] RENDER ERROR:`, err.message);
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-    res.status(500).json({
-      success: false,
-      error: err.message,
-      job_id: jobId,
-    });
+    console.error('[' + jobId + '] Error: ' + err.message);
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+    res.status(500).json({ success: false, error: err.message, job_id: jobId });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`vault-ffmpeg-render v1.1.0 listening on port ${PORT}`);
-});
+app.listen(PORT, function() { console.log('vault-ffmpeg-render v1.2.0 listening on port ' + PORT); });
