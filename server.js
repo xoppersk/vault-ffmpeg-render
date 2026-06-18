@@ -8,8 +8,16 @@ const http = require('http');
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-const WORKER_URL = process.env.WORKER_URL;
-const WORKER_TOKEN = process.env.WORKER_TOKEN;
+const WORKER_URL_FALLBACK = 'https://vault-clip-host.sevynholdings.workers.dev';
+const WORKER_URL = process.env.WORKER_URL || WORKER_URL_FALLBACK;
+if (!process.env.WORKER_URL) {
+  console.warn('[STARTUP] WORKER_URL env var missing — using hardcoded fallback: ' + WORKER_URL_FALLBACK);
+}
+const WORKER_TOKEN_FALLBACK = 'vault-w4-upload-2026';
+const WORKER_TOKEN = process.env.WORKER_TOKEN || WORKER_TOKEN_FALLBACK;
+if (!process.env.WORKER_TOKEN) {
+  console.warn('[STARTUP] WORKER_TOKEN env var missing — using hardcoded fallback');
+}
 const RENDER_TOKEN = process.env.RENDER_TOKEN;
 const PORT = process.env.PORT || 3000;
 
@@ -37,7 +45,12 @@ function uploadToR2(buffer, filename) {
   return new Promise(function(resolve, reject) {
     var base64 = buffer.toString('base64');
     var body = JSON.stringify({ data: base64, encoding: 'base64' });
-    var url = new URL(WORKER_URL + '/upload?filename=' + encodeURIComponent(filename));
+    var fullUrl = WORKER_URL + '/upload?filename=' + encodeURIComponent(filename);
+    if (!WORKER_URL || WORKER_URL === 'undefined') {
+      reject(new Error('WORKER_URL is not configured. Set WORKER_URL env var on Render or check hardcoded fallback. Current value: ' + String(WORKER_URL)));
+      return;
+    }
+    var url = new URL(fullUrl);
     var options = {
       hostname: url.hostname, port: 443,
       path: url.pathname + url.search, method: 'POST',
@@ -97,7 +110,7 @@ function runFFmpeg(cmd, timeoutMs) {
 }
 
 app.get('/', function(req, res) {
-  res.json({ status: 'ok', service: 'vault-ffmpeg-render', version: '1.3.0' });
+  res.json({ status: 'ok', service: 'vault-ffmpeg-render', version: '1.3.1' });
 });
 
 app.post('/render', async function(req, res) {
