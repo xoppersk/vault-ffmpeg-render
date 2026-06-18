@@ -109,8 +109,32 @@ function runFFmpeg(cmd, timeoutMs) {
   });
 }
 
+function getAudioDuration(filePath) {
+  return new Promise(function(resolve, reject) {
+    var cmd = 'ffprobe -v error -show_entries format=duration -of csv=p=0 "' + filePath + '"';
+    var proc = spawn('sh', ['-c', cmd], { stdio: ['ignore', 'pipe', 'pipe'] });
+    var stdout = '';
+    var stderr = '';
+    proc.stdout.on('data', function(chunk) { stdout += chunk.toString(); });
+    proc.stderr.on('data', function(chunk) { stderr += chunk.toString(); });
+    proc.on('close', function(code) {
+      if (code === 0 && stdout.trim()) {
+        var dur = parseFloat(stdout.trim());
+        if (isNaN(dur) || dur <= 0) {
+          reject(new Error('Invalid audio duration from ffprobe: ' + stdout.trim()));
+        } else {
+          resolve(dur);
+        }
+      } else {
+        reject(new Error('ffprobe failed (code ' + code + '): ' + stderr));
+      }
+    });
+    proc.on('error', reject);
+  });
+}
+
 app.get('/', function(req, res) {
-  res.json({ status: 'ok', service: 'vault-ffmpeg-render', version: '1.3.1' });
+  res.json({ status: 'ok', service: 'vault-ffmpeg-render', version: '1.3.2' });
 });
 
 app.post('/render', async function(req, res) {
@@ -129,7 +153,9 @@ app.post('/render', async function(req, res) {
   var tmpDir = '/tmp/render-' + jobId;
   fs.mkdirSync(tmpDir, { recursive: true });
   var secPerClip = clip_duration || 5;
-  var totalDuration = clips.length * secPerClip;
+  var clipBasedDuration = clips.length * secPerClip;
+  // totalDuration will be overridden by actual audio duration after download
+  var totalDuration = clipBasedDuration;
 
   console.log('[' + jobId + '] Downloading ' + clips.length + ' clips + 1 audio...');
 
@@ -146,6 +172,12 @@ app.post('/render', async function(req, res) {
     var clipPaths = allPaths.slice(0, -1);
     var dlTime = ((Date.now() - downloadStart) / 1000).toFixed(1);
     console.log('[' + jobId + '] Downloads complete in ' + dlTime + 's');
+
+    // --- PHASE 1.5: Detect voiceover duration and calculate clip loop count ---
+    var audioDurationSec = await getAudioDuration(audioDest);
+    totalDuration = Math.ceil(audioDurationSec);
+    var loopCount = Math.max(1, Math.ceil(totalDuration / (clips.length * secPerClip)));
+    console.log('[' + jobId + '] Audio duration: ' + audioDurationSec.toFixed(1) + 's, loop each clip ' + loopCount + 'x');
 
     // --- PHASE 2: Pre-process each clip individually (low memory) ---
     console.log('[' + jobId + '] Pre-processing ' + clipPaths.length + ' clips...');
@@ -166,16 +198,21 @@ app.post('/render', async function(req, res) {
 
     // --- PHASE 3: Concat via demuxer (near-zero memory) ---
     var concatList = path.join(tmpDir, 'concat.txt');
-    var listContent = prepPaths.map(function(p) {
-      return "file '" + p + "'";
-    }).join('\n');
+    var listLines = [];
+    for (var ci = 0; ci < prepPaths.length; ci++) {
+      for (var ri = 0; ri < loopCount; ri++) {
+        listLines.push("file '" + prepPaths[ci] + "'");
+      }
+    }
+    var listContent = listLines.join('\n');
     fs.writeFileSync(concatList, listContent);
+    console.log('[' + jobId + '] Concat list: ' + listLines.length + ' entries (' + prepPaths.length + ' clips x ' + loopCount + ' loops)');
 
     var concatDest = path.join(tmpDir, 'concat.ts');
     var concatCmd = 'ffmpeg -f concat -safe 0 -i "' + concatList + '" -c copy -y "' + concatDest + '"';
 
     console.log('[' + jobId + '] Concatenating...');
-    await runFFmpeg(concatCmd, 60000);
+    await runFFmpeg(concatCmd, 180000);
     console.log('[' + jobId + '] Concat complete');
 
     // --- PHASE 4: Mux audio onto concatenated video ---
@@ -186,7 +223,7 @@ app.post('/render', async function(req, res) {
 
     console.log('[' + jobId + '] Muxing audio...');
     var encodeStart = Date.now();
-    await runFFmpeg(muxCmd, 120000);
+    await runFFmpeg(muxCmd, 300000);
     var encodeTime = ((Date.now() - encodeStart) / 1000).toFixed(1);
     console.log('[' + jobId + '] Mux complete in ' + encodeTime + 's');
 
